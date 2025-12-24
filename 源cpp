@@ -1,0 +1,625 @@
+#include <SFML/Graphics.hpp>
+#include <vector>
+#include <memory>
+#include <string>
+#include <cstdlib>
+#include <ctime>
+#include <algorithm>
+#include <cmath>
+#include <windows.h> // 用于 MessageBoxA
+
+using namespace sf;
+
+ String toSfString(const std::string& str) {
+    return String::fromUtf8(str.begin(), str.end());
+}
+
+static void setSpriteCover(Sprite& sprite, const Texture& texture, const Vector2f& targetSize) {
+    sprite.setTexture(texture, true);
+
+    const Vector2u texSize = texture.getSize();
+    if (texSize.x == 0 || texSize.y == 0 || targetSize.x <= 0.f || targetSize.y <= 0.f) {
+        return;
+    }
+
+    const float targetRatio = targetSize.x / targetSize.y;
+    const float texRatio = static_cast<float>(texSize.x) / static_cast<float>(texSize.y);
+
+    IntRect rect(0, 0, static_cast<int>(texSize.x), static_cast<int>(texSize.y));
+
+    if (texRatio > targetRatio) {
+        const int newW = static_cast<int>(std::lround(static_cast<float>(texSize.y) * targetRatio));
+        const int x = std::max(0, (static_cast<int>(texSize.x) - newW) / 2);
+        rect = IntRect(x, 0, std::min(newW, static_cast<int>(texSize.x)), static_cast<int>(texSize.y));
+    } else if (texRatio < targetRatio) {
+        int newH = static_cast<int>(std::lround(static_cast<float>(texSize.x) / targetRatio));
+        newH = std::min(newH, static_cast<int>(texSize.y));
+        rect = IntRect(0, 0, static_cast<int>(texSize.x), newH);
+    }
+
+    sprite.setTextureRect(rect);
+    sprite.setPosition(0.f, 0.f);
+    sprite.setScale(targetSize.x / static_cast<float>(rect.width), targetSize.y / static_cast<float>(rect.height));
+}
+
+static void setSpriteCoverTopCrop(Sprite& sprite, const Texture& texture, const Vector2f& targetSize, float heightFraction) {
+    sprite.setTexture(texture, true);
+
+    const Vector2u texSize = texture.getSize();
+    if (texSize.x == 0 || texSize.y == 0 || targetSize.x <= 0.f || targetSize.y <= 0.f) {
+        return;
+    }
+
+    heightFraction = std::clamp(heightFraction, 0.1f, 1.0f);
+    const int cropH = std::max(1, static_cast<int>(std::lround(static_cast<float>(texSize.y) * heightFraction)));
+    const float targetRatio = targetSize.x / targetSize.y;
+
+    int rectW = static_cast<int>(texSize.x);
+    int rectH = cropH;
+    int rectX = 0;
+    int rectY = 0;
+
+    const float candidateRatio = static_cast<float>(rectW) / static_cast<float>(rectH);
+    if (candidateRatio > targetRatio) {
+        const int newW = std::max(1, static_cast<int>(std::lround(static_cast<float>(rectH) * targetRatio)));
+        rectX = std::max(0, (rectW - newW) / 2);
+        rectW = std::min(newW, rectW);
+    } else if (candidateRatio < targetRatio) {
+        const int newH = std::max(1, static_cast<int>(std::lround(static_cast<float>(rectW) / targetRatio)));
+        rectH = std::min(newH, rectH);
+    }
+
+    sprite.setTextureRect(IntRect(rectX, rectY, rectW, rectH));
+    sprite.setPosition(0.f, 0.f);
+    sprite.setScale(targetSize.x / static_cast<float>(rectW), targetSize.y / static_cast<float>(rectH));
+}
+
+static bool loadTextureKeyWhiteAndCrop(Texture& texture, IntRect& outRect, const std::string& path, Uint8 bgBrightnessThreshold = 210, Uint8 bgChromaThreshold = 25) {
+    Image img;
+    if (!img.loadFromFile(path)) {
+        return false;
+    }
+
+    const Vector2u size = img.getSize();
+    if (size.x == 0 || size.y == 0) {
+        outRect = IntRect(0, 0, 0, 0);
+        return texture.loadFromImage(img);
+    }
+
+    unsigned int minX = size.x;
+    unsigned int minY = size.y;
+    unsigned int maxX = 0;
+    unsigned int maxY = 0;
+    bool found = false;
+
+    for (unsigned int y = 0; y < size.y; ++y) {
+        for (unsigned int x = 0; x < size.x; ++x) {
+            Color c = img.getPixel(x, y);
+            if (c.a == 0) {
+                continue;
+            }
+
+            const Uint8 mx = std::max({c.r, c.g, c.b});
+            const Uint8 mn = std::min({c.r, c.g, c.b});
+            const Uint8 chroma = static_cast<Uint8>(mx - mn);
+            const Uint8 brightness = static_cast<Uint8>((static_cast<unsigned int>(c.r) + static_cast<unsigned int>(c.g) + static_cast<unsigned int>(c.b)) / 3u);
+            const bool isBg = (brightness >= bgBrightnessThreshold) && (chroma <= bgChromaThreshold);
+
+            if (isBg) {
+                c.a = 0;
+                img.setPixel(x, y, c);
+                continue;
+            }
+
+            found = true;
+            minX = std::min(minX, x);
+            minY = std::min(minY, y);
+            maxX = std::max(maxX, x);
+            maxY = std::max(maxY, y);
+        }
+    }
+
+    if (!found) {
+        outRect = IntRect(0, 0, static_cast<int>(size.x), static_cast<int>(size.y));
+    } else {
+        const int left = static_cast<int>(minX);
+        const int top = static_cast<int>(minY);
+        const int width = static_cast<int>(maxX - minX + 1);
+        const int height = static_cast<int>(maxY - minY + 1);
+        outRect = IntRect(left, top, width, height);
+    }
+
+    if (!texture.loadFromImage(img)) {
+        return false;
+    }
+    texture.setSmooth(true);
+    return true;
+}
+
+// ============================================================================
+// [1. Base Character Class] — Encapsulates health, damage, and health bar rendering.
+// ============================================================================
+class Character {
+protected:
+    std::string name;
+    int hp, maxHp;
+    int attack;
+    int defense;
+
+public:
+    Character(const std::string& n, int h, int a, int d)
+        : name(n), hp(h), maxHp(h), attack(a), defense(d) {}
+
+    virtual ~Character() = default;
+
+ 
+    void drawHP(RenderWindow& window, float x, float y, Color barColor, const Font& font) const {
+        // background black bar
+        RectangleShape bg(Vector2f(100, 12));
+        bg.setPosition(x, y);
+        bg.setFillColor(Color::Black);
+        window.draw(bg);
+
+        // Blood volume prospects
+        float ratio = 0.0f;
+        if (maxHp > 0)
+            ratio = static_cast<float>(hp) / maxHp;
+        if (ratio < 0) ratio = 0;
+        if (ratio > 1) ratio = 1;
+
+        RectangleShape fg(Vector2f(100 * ratio, 12));
+        fg.setPosition(x, y);
+        fg.setFillColor(barColor);
+        window.draw(fg);
+
+        // Name Tag        
+Text text(toSfString(name), font, 14);
+        text.setPosition(x, y - 20);
+        text.setFillColor(Color::White);
+        // text.setOutlineColor(Color::Black); // 可选：增加描边让文字更清晰
+        // text.setOutlineThickness(1);
+        window.draw(text);
+    }
+
+// Affected (considering defense)    
+void takeDamage(int damage) {
+        int real = std::max(1, damage - defense); 
+        hp = std::max(0, hp - real);
+    }
+
+    bool isAlive() const { return hp > 0; }
+    std::string getName() const { return name; }
+
+// Pure virtual functions: polymorphic skills    
+virtual void specialSkill(Character& target) = 0;
+};
+
+// ============================================================================
+// [2. Monster Base Classes and Specific Monsters] - Inheritance+Polymorphism
+// ============================================================================
+class Monster : public Character {
+public:
+    Sprite sprite;
+
+    Monster(const std::string& n, int h, int a, int d) : Character(n, h, a, d) {}
+
+    void setTexture(const Texture& tex, const IntRect& rect) {
+        sprite.setTexture(tex, true);
+        sprite.setTextureRect(rect);
+
+        const float maxDim = static_cast<float>(std::max(rect.width, rect.height));
+        const float desired = 140.0f;
+        const float scale = (maxDim > 0.f) ? (desired / maxDim) : 1.0f;
+        sprite.setScale(scale, scale);
+        sprite.setOrigin(rect.width / 2.0f, rect.height / 2.0f);
+    }
+};
+
+class Dinosaur : public Monster {
+public:
+    Dinosaur() : Monster("恐龙", 60, 25, 5) {}
+    void specialSkill(Character& target) override {
+        target.takeDamage(15 + rand() % 10); //  
+};
+
+    }
+
+class Bird : public Monster {
+public:
+    Bird() : Monster("鸟", 40, 20, 3) {}
+    void specialSkill(Character& target) override {
+        target.takeDamage(10 + rand() % 8);  
+    }
+};
+
+class Snake : public Monster {
+public:
+    Snake() : Monster("蛇", 50, 18, 7) {}
+    void specialSkill(Character& target) override {
+        target.takeDamage(12 + rand() % 15); //  
+    }
+};
+
+// ============================================================================
+// 【3. player】// ============================================================================
+class Player : public Character {
+public:
+    Sprite sprite;
+
+    Player() : Character("李相夷", 100, 20, 10) {}
+
+    void setTexture(const Texture& tex, const IntRect& rect) {
+        sprite.setTexture(tex, true);
+        sprite.setTextureRect(rect);
+
+        const float maxDim = static_cast<float>(std::max(rect.width, rect.height));
+        const float desired = 100.0f;
+        const float scale = (maxDim > 0.f) ? (desired / maxDim) : 1.0f;
+        sprite.setScale(scale, scale);
+        sprite.setOrigin(rect.width / 2.0f, rect.height / 2.0f);
+    }
+
+    void normalAttack(Monster& monster) {
+        monster.takeDamage(attack + rand() % 10); // 20~29 伤害
+    }
+
+    void skillAttack(Monster& monster) {
+        monster.takeDamage(attack * 2); // 闪避反击：40 固定伤害
+    }
+
+    void specialSkill(Character& target) override {        
+        target.takeDamage(attack * 2);      
+    }    
+};
+
+// ============================================================================
+// 【4. Game State Manager】 
+// ============================================================================
+enum class GameState {
+    MAIN_MENU,
+    IN_GAME,
+    BATTLE,
+    GAME_OVER
+};
+
+// ============================================================================
+// 【5. main function】 
+// ============================================================================
+int main() {
+    srand(static_cast<unsigned>(time(nullptr)));
+
+    RenderWindow window(VideoMode(800, 600), toSfString("沙滩地牢宝藏探险"));
+    window.setFramerateLimit(60);
+    const Vector2f logicalSize(800.f, 600.f);
+
+    // ------------------------------------------------------------------------
+    // 【Resource loading】
+    // ------------------------------------------------------------------------
+    
+    // 1. 加载字体（只加载一次！）
+    Font globalFont;
+    // 优先加载本地字体，失败则尝试系统字体
+    if (!globalFont.loadFromFile("resources/font.ttc") && 
+        !globalFont.loadFromFile("C:/Windows/Fonts/msyh.ttc") &&
+        !globalFont.loadFromFile("C:/Windows/Fonts/simhei.ttf")) {
+        MessageBoxA(nullptr, "无法加载中文字体！请确保 resources/font.ttc 存在。", "错误", MB_ICONERROR);
+        return -1;
+    }
+
+    Texture startTex, bgTex, playerTex, dinoTex, birdTex, snakeTex;
+    IntRect playerRect, dinoRect, birdRect, snakeRect;
+
+    struct TexLoadItem {
+        Texture* tex;
+        std::string path;
+    };
+
+    const std::vector<TexLoadItem> normalLoads = {
+        {&startTex, "resources/start_screen.png"},
+        {&bgTex, "resources/background_map.jpg"},
+    };
+
+    for (const auto& item : normalLoads) {
+        if (!item.tex->loadFromFile(item.path)) {
+            std::string msg = "无法加载图片:\n" + item.path;
+            MessageBoxA(nullptr, msg.c_str(), "资源加载失败", MB_ICONERROR);
+            return -1;
+        }
+        item.tex->setSmooth(true);
+    }
+
+    if (!loadTextureKeyWhiteAndCrop(playerTex, playerRect, "resources/player.png")) {
+        MessageBoxA(nullptr, "无法加载图片:\nresources/player.png", "资源加载失败", MB_ICONERROR);
+        return -1;
+    }
+    if (!loadTextureKeyWhiteAndCrop(dinoTex, dinoRect, "resources/dinosaur.png")) {
+        MessageBoxA(nullptr, "无法加载图片:\nresources/dinosaur.png", "资源加载失败", MB_ICONERROR);
+        return -1;
+    }
+    if (!loadTextureKeyWhiteAndCrop(birdTex, birdRect, "resources/bird.png")) {
+        MessageBoxA(nullptr, "无法加载图片:\nresources/bird.png", "资源加载失败", MB_ICONERROR);
+        return -1;
+    }
+    if (!loadTextureKeyWhiteAndCrop(snakeTex, snakeRect, "resources/snake.png")) {
+        MessageBoxA(nullptr, "无法加载图片:\nresources/snake.png", "资源加载失败", MB_ICONERROR);
+        return -1;
+    }
+
+    Sprite startSprite;
+    Sprite background;
+    setSpriteCover(startSprite, startTex, logicalSize);
+    setSpriteCoverTopCrop(background, bgTex, logicalSize, 0.55f);
+
+    RectangleShape battleOverlay(logicalSize);
+    battleOverlay.setFillColor(Color(0, 0, 0, 180));
+
+    // ------------------------------------------------------------------------
+    // 【View initialization】
+    // ------------------------------------------------------------------------
+    // 创建一个固定的 800x600 视图，无论窗口怎么调整，游戏逻辑都认为是在 800x600 的范围内
+    View gameView(FloatRect(0, 0, logicalSize.x, logicalSize.y));
+    window.setView(gameView);
+
+    // ------------------------------------------------------------------------
+    // 【Role initialization】
+    // ------------------------------------------------------------------------
+    auto createPlayer = [&]() {
+        auto p = std::make_unique<Player>();
+        p->setTexture(playerTex, playerRect);
+        p->sprite.setPosition(100, 300);
+        return p;
+    };
+
+    auto createMonsters = [&](std::vector<std::unique_ptr<Monster>>& monsters) {
+        monsters.clear();
+
+        auto dino = std::make_unique<Dinosaur>();
+        dino->setTexture(dinoTex, dinoRect);
+        dino->sprite.setPosition(500, 200);
+
+        auto bird = std::make_unique<Bird>();
+        bird->setTexture(birdTex, birdRect);
+        bird->sprite.setPosition(300, 400);
+
+        auto snake = std::make_unique<Snake>();
+        snake->setTexture(snakeTex, snakeRect);
+        snake->sprite.setPosition(600, 400);
+
+        monsters.push_back(std::move(dino));
+        monsters.push_back(std::move(bird));
+        monsters.push_back(std::move(snake));
+    };
+
+    auto player = createPlayer();
+    std::vector<std::unique_ptr<Monster>> monsters;
+    createMonsters(monsters);
+
+    Monster* currentMonster = nullptr;
+    GameState state = GameState::MAIN_MENU;
+    bool gameWon = false;
+    Vector2f savedPlayerPos;
+    Vector2f savedMonsterPos;
+    bool hasSavedBattlePositions = false;
+
+    // ------------------------------------------------------------------------
+    // 【main loop】
+    // ------------------------------------------------------------------------
+    while (window.isOpen()) {
+        Event event;
+        while (window.pollEvent(event)) {
+            if (event.type == Event::Closed) {
+                window.close();
+            }
+
+            // ---------------- 窗口调整大小事件 (修复画面不全问题) ----------------
+            if (event.type == Event::Resized) {
+                // 计算新的视口，保持 800x600 的比例 (Letterboxing)
+                float windowRatio = event.size.width / (float)event.size.height;
+                float viewRatio = 800.0f / 600.0f;
+                float sizeX = 1;
+                float sizeY = 1;
+                float posX = 0;
+                float posY = 0;
+
+                if (windowRatio > viewRatio) {
+                    sizeX = viewRatio / windowRatio;
+                    posX = (1 - sizeX) / 2.f;
+                } else {
+                    sizeY = windowRatio / viewRatio;
+                    posY = (1 - sizeY) / 2.f;
+                }
+
+                gameView.setViewport(FloatRect(posX, posY, sizeX, sizeY));
+                window.setView(gameView);
+            }
+
+            // ---------------- 主菜单事件 ----------------
+            if (state == GameState::MAIN_MENU) {
+                if (event.type == Event::MouseButtonPressed) {
+                    // 修复：将鼠标屏幕坐标转换为游戏世界坐标
+                    Vector2i mousePixelPos = Mouse::getPosition(window);
+                    Vector2f mousePos = window.mapPixelToCoords(mousePixelPos);
+                    
+                    FloatRect startBtn(300, 300, 200, 50);   // “开始游戏”按钮区域
+                    FloatRect exitBtn(300, 400, 200, 50);    // “退出”按钮区域
+
+                    if (startBtn.contains(static_cast<float>(mousePos.x), static_cast<float>(mousePos.y))) {
+                        state = GameState::IN_GAME;
+                    } else if (exitBtn.contains(static_cast<float>(mousePos.x), static_cast<float>(mousePos.y))) {
+                        window.close();
+                    }
+                }
+            }
+
+            // ---------------- 游戏进行中事件 ----------------
+            if (state == GameState::IN_GAME && event.type == Event::KeyPressed) {
+                Vector2f move(0, 0);
+                if (event.key.code == Keyboard::W) move.y = -5;
+                if (event.key.code == Keyboard::S) move.y = 5;
+                if (event.key.code == Keyboard::A) move.x = -5;
+                if (event.key.code == Keyboard::D) move.x = 5;
+
+                player->sprite.move(move);
+
+                // 检测是否碰到怪物
+                FloatRect playerBounds = player->sprite.getGlobalBounds();
+                for (auto& m : monsters) {
+                    if (m && m->isAlive() && playerBounds.intersects(m->sprite.getGlobalBounds())) {
+                        currentMonster = m.get();
+                        state = GameState::BATTLE;
+                        savedPlayerPos = player->sprite.getPosition();
+                        savedMonsterPos = currentMonster->sprite.getPosition();
+                        hasSavedBattlePositions = true;
+
+                        player->sprite.setPosition(200.f, 350.f); // 战斗位置（中心）
+                        currentMonster->sprite.setPosition(600.f, 250.f); // 战斗位置（中心）
+                        break;
+                    }
+                }
+            }
+
+            // ---------------- 战斗事件 ----------------
+            if (state == GameState::BATTLE && event.type == Event::KeyPressed) {
+                if (currentMonster && (event.key.code == Keyboard::Num1 || event.key.code == Keyboard::Num2)) {
+                    if (event.key.code == Keyboard::Num1) {
+                        player->normalAttack(*currentMonster);
+                    } else {
+                        player->skillAttack(*currentMonster);
+                    }
+
+                    // 怪物死亡？
+                    if (!currentMonster->isAlive()) {
+                        // 检查是否全部死亡
+                        bool allDead = true;
+                        for (auto& m : monsters) {
+                            if (m && m->isAlive()) {
+                                allDead = false;
+                                break;
+                            }
+                        }
+                        if (allDead) {
+                            gameWon = true;
+                            state = GameState::GAME_OVER;
+                        } else {
+                            state = GameState::IN_GAME;
+                        }
+                        if (hasSavedBattlePositions) {
+                            player->sprite.setPosition(savedPlayerPos);
+                            hasSavedBattlePositions = false;
+                        }
+                        currentMonster = nullptr;
+                    } else {
+                        // 怪物反击
+                        currentMonster->specialSkill(*player);
+                        if (!player->isAlive()) {
+                            gameWon = false;
+                            state = GameState::GAME_OVER;
+                            if (hasSavedBattlePositions) {
+                                player->sprite.setPosition(savedPlayerPos);
+                                hasSavedBattlePositions = false;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ---------------- 游戏结束事件 ----------------
+            if (state == GameState::GAME_OVER && event.type == Event::MouseButtonPressed) {
+                // 修复：将鼠标屏幕坐标转换为游戏世界坐标
+                Vector2i mousePixelPos = Mouse::getPosition(window);
+                Vector2f mousePos = window.mapPixelToCoords(mousePixelPos);
+                
+                FloatRect restartBtn(200, 400, 180, 50);   // “重新开始”
+                FloatRect menuBtn(420, 400, 180, 50);       // “返回主菜单”
+
+                if (restartBtn.contains(static_cast<float>(mousePos.x), static_cast<float>(mousePos.y))) {
+                    // 重置游戏
+                    player = createPlayer();
+                    createMonsters(monsters);
+                    state = GameState::IN_GAME;
+                } else if (menuBtn.contains(static_cast<float>(mousePos.x), static_cast<float>(mousePos.y))) {
+                    state = GameState::MAIN_MENU;
+                }
+            }
+        }
+
+        // ------------------------------------------------------------------------
+        // 【draw】
+        // ------------------------------------------------------------------------
+        // 使用天蓝色清空窗口，防止背景图缺失时显示黑色或灰色
+        window.clear(Color(135, 206, 235)); 
+
+        if (state == GameState::MAIN_MENU) {
+            window.draw(startSprite);
+
+            // 绘制菜单按钮（用文字模拟）
+            Text startText(toSfString("开始游戏"), globalFont, 32);
+            startText.setPosition(320, 300);
+            startText.setFillColor(Color::White);
+            startText.setOutlineColor(Color::Black);
+            startText.setOutlineThickness(2);
+            window.draw(startText);
+
+            Text exitText(toSfString("退出游戏"), globalFont, 32);
+            exitText.setPosition(320, 400);
+            exitText.setFillColor(Color::White);
+            exitText.setOutlineColor(Color::Black);
+            exitText.setOutlineThickness(2);
+            window.draw(exitText);
+
+        } else if (state == GameState::IN_GAME) {
+            window.draw(background);
+            for (auto& m : monsters) {
+                if (m && m->isAlive()) {
+                    window.draw(m->sprite);
+                }
+            }
+            window.draw(player->sprite);
+            player->drawHP(window, 50, 50, Color::Green, globalFont);
+
+        } else if (state == GameState::BATTLE && currentMonster) {
+            window.draw(background);
+            window.draw(battleOverlay);
+            window.draw(player->sprite);
+            window.draw(currentMonster->sprite);
+
+            RectangleShape panel(Vector2f(800.f, 180.f));
+            panel.setPosition(0.f, 420.f);
+            panel.setFillColor(Color(0, 0, 0, 140));
+            window.draw(panel);
+
+            // 血条
+            currentMonster->drawHP(window, 550, 100, Color::Red, globalFont);
+            player->drawHP(window, 100, 100, Color::Green, globalFont);
+
+            // 操作提示
+            Text tip(toSfString("按 1: 普通攻击    按 2: 闪避反击"), globalFont, 20);
+            tip.setFillColor(Color::Yellow);
+            tip.setPosition(200, 460);
+            window.draw(tip);
+
+        } else if (state == GameState::GAME_OVER) {
+            window.draw(background);
+            window.draw(battleOverlay);
+            
+            Text result(toSfString(gameWon ? "🎉 恭喜通关！李相夷找到宝藏！" : "💀 李相夷战败...游戏结束"), globalFont, 30);
+            result.setFillColor(gameWon ? Color::Yellow : Color::Red);
+            result.setPosition(150, 200);
+            window.draw(result);
+
+            Text restart(toSfString("重新开始"), globalFont, 28);
+            restart.setPosition(220, 400);
+            restart.setFillColor(Color::White);
+            window.draw(restart);
+
+            Text menu(toSfString("返回主菜单"), globalFont, 28);
+            menu.setPosition(430, 400);
+            menu.setFillColor(Color::White);
+            window.draw(menu);
+        }
+
+        window.display();
+    }
+
+    return 0;
+}
